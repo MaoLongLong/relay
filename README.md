@@ -1,6 +1,6 @@
 # Relay
 
-minimal TCP relay (proxy)
+Minimal TCP relay (proxy).
 
 ```text
 +--------+         +--------+         +--------+
@@ -13,6 +13,6 @@ Install and usage:
 ```bash
 go install go.chensl.me/relay@latest
 
-# relay <from> <to>
+# relay [-debug] <from> <to>
 relay 127.0.0.1:8081 127.0.0.1:8080
 ```

@@ -5,47 +5,117 @@
 package main
 
 import (
+	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
+
+	"github.com/oklog/run"
+	log "github.com/sirupsen/logrus"
+)
+
+var cnt uint64
+
+var (
+	debug = flag.Bool("debug", false, "Print debug info")
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <from> <to>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: relay [options] <from> <to>\n")
+	fmt.Fprintf(os.Stderr, "Options:\n")
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, "Examples:\n")
+	fmt.Fprintf(os.Stderr, "\trelay 127.0.0.1:8081 127.0.0.1:8080\n")
+	fmt.Fprintf(os.Stderr, "\trelay -debug 127.0.0.1:8081 127.0.0.1:8080\n")
 	os.Exit(2)
 }
 
-func handle(from *net.TCPConn, taddr *net.TCPAddr) {
-	defer from.Close()
+func handle(cli *net.TCPConn, taddr *net.TCPAddr) {
+	id := atomic.AddUint64(&cnt, 1)
+	log.Infof("[%v] Accepted from: %v", id, cli.RemoteAddr())
 
-	to, err := net.DialTCP("tcp", nil, taddr)
+	srv, err := net.DialTCP("tcp", nil, taddr)
 	if err != nil {
-		log.Println(err)
+		log.WithError(err).Errorf("[%v] Failed to dial %v", id, taddr)
 		return
 	}
-	defer to.Close()
+	log.Infof("[%v] Connected to server: %v", id, srv.RemoteAddr())
 
-	go io.Copy(to, from)
-	io.Copy(from, to)
+	closeSrv := func(_ error) {
+		srv.Close()
+		log.Infof("[%v] Server connection closed", id)
+	}
+	closeCli := func(_ error) {
+		cli.Close()
+		log.Infof("[%v] Client connection closed", id)
+	}
+
+	var g run.Group
+	if *debug {
+		g.Add(func() error { return dump(id, "server", cli, srv) }, closeSrv)
+		g.Add(func() error { return dump(id, "client", srv, cli) }, closeCli)
+	} else {
+		g.Add(func() error { _, err := io.Copy(cli, srv); return err }, closeSrv)
+		g.Add(func() error { _, err := io.Copy(srv, cli); return err }, closeCli)
+	}
+
+	if err := g.Run(); err != nil && err != io.EOF {
+		log.WithError(err).Errorf("[%v] Failed to transfer data", id)
+	}
+}
+
+func dump(id uint64, source string, dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			log.Debugf("[%v] Read from %v:\n%v\n", id, source, hex.Dump(buf[:nr]))
+
+			nw, ew := dst.Write(buf[:nr])
+			if nw < 0 || nr < nw {
+				return errors.New("invalid write result")
+			}
+			if ew != nil {
+				return ew
+			}
+			if nr != nw {
+				return io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			return er
+		}
+	}
 }
 
 func main() {
-	if len(os.Args) != 3 {
+	flag.Usage = usage
+	flag.Parse()
+	if flag.NArg() != 2 {
 		usage()
 	}
 
-	faddr, err := net.ResolveTCPAddr("tcp", os.Args[1])
+	log.SetFormatter(&log.TextFormatter{
+		ForceColors:      true,
+		DisableTimestamp: true,
+	})
+	if *debug {
+		log.SetLevel(log.DebugLevel)
+	}
+
+	faddr, err := net.ResolveTCPAddr("tcp", flag.Arg(0))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	taddr, err := net.ResolveTCPAddr("tcp", os.Args[2])
+	taddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -71,12 +141,14 @@ func main() {
 			go handle(conn, taddr)
 		}
 	}()
+	log.Infof("Relay server listening on %v", faddr)
 
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(quit, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(quit)
 
 	<-quit
+	log.Info("Shutdown...")
 	ln.Close()
 	wg.Wait()
 }
